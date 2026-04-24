@@ -1,0 +1,28 @@
+whisper:
+  model: small
+  language: pt
+  device: auto
+  compute_type: auto
+  beam_size: 1
+  vad_filter: true
+  model_dir: models
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  prebuffer_seconds: 0.6
+
+hotkey:
+  combo: ctrl+windows
+
+overlay:
+  size: 72
+  margin: 24
+  corner: bottom-right
+  opacity: 0.92
+
+inject:
+  mode: paste
+  keystroke_delay_ms: 15
+  restore_clipboard: true
+  trailing_space: true

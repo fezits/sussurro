@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sussurro</string>
+    <string name="service_label">Sussurro Bubble</string>
+    <string name="service_channel_name">Sussurro overlay</string>
+    <string name="notification_title">Sussurro ativo</string>
+    <string name="notification_text">Toque e segure a bolinha para ditar</string>
+    <string name="notification_text_ready">Pronto · segure a bolinha para falar</string>
+    <string name="accessibility_description">Permite ao Sussurro colar o texto transcrito direto no campo focado.</string>
+    <string name="copied_to_clipboard">Texto copiado — toque em Colar</string>
+    <string name="paste">Colar</string>
+</resources>

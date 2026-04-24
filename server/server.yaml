@@ -1,0 +1,12 @@
+server:
+  host: 0.0.0.0
+  port: 8765
+
+whisper:
+  model: small
+  language: pt
+  device: auto
+  compute_type: auto
+  beam_size: 1
+  vad_filter: true
+  model_dir: models
