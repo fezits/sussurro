@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import numpy as np
+import torch
 from silero_vad import load_silero_vad
 
 
@@ -38,7 +39,6 @@ class Vad:
             frame = self._buf[: self.FRAME]
             self._buf = self._buf[self.FRAME :]
 
-            import torch
             prob = float(self.model(torch.from_numpy(frame), self.sample_rate).item())
             speech = prob >= 0.5
 
