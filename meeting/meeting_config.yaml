@@ -1,0 +1,42 @@
+audio:
+  system_loopback: true
+  microphone: true
+  save_raw_wav: false
+  vad_silence_ms: 800
+
+transcribe:
+  model: small
+  language: pt
+  parallel_workers: 2
+
+llm:
+  provider: groq
+  model: llama-3.3-70b-versatile
+  api_key_env: GROQ_API_KEY
+  classifier_model: llama-3.1-8b-instant
+
+  local:
+    model_path: models/llm/qwen2.5-7b-instruct-q4_k_m.gguf
+    n_ctx: 8192
+    n_threads: 8
+
+rag:
+  knowledge_dir: knowledge
+  embedding_model: paraphrase-multilingual-MiniLM-L12-v2
+  chunk_size: 500
+  chunk_overlap: 50
+  top_k: 5
+
+intelligence:
+  question_detection: true
+  auto_suggest: true
+  context_window_minutes: 2
+  suggestion_ttl_seconds: 90
+
+ui:
+  invisible_to_capture: true
+  opacity: 0.92
+  always_on_top: true
+
+storage:
+  output_dir: reunioes

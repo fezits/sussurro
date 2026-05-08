@@ -67,3 +67,12 @@ mobile/*.png
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# Meeting mode
+reunioes/
+knowledge/.index.npz
+knowledge/.partial/
+meeting/.window_state.json
+
+# LLM models (downloaded on demand)
+models/llm/
