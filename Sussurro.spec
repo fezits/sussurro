@@ -8,7 +8,13 @@ hidden += collect_submodules("tokenizers")
 hidden += collect_submodules("huggingface_hub")
 hidden += collect_submodules("onnxruntime")
 hidden += collect_submodules("av")
-hidden += ["sounddevice", "soundfile", "cffi", "yaml", "keyboard", "pyperclip"]
+hidden += collect_submodules("meeting")
+hidden += collect_submodules("sentence_transformers")
+hidden += collect_submodules("silero_vad")
+hidden += collect_submodules("groq")
+hidden += collect_submodules("pypdf")
+hidden += collect_submodules("pyaudiowpatch")
+hidden += ["sounddevice", "soundfile", "cffi", "yaml", "keyboard", "pyperclip", "win32api", "win32con"]
 
 datas = []
 datas += collect_data_files("faster_whisper")
@@ -16,7 +22,9 @@ datas += collect_data_files("ctranslate2")
 datas += collect_data_files("tokenizers")
 datas += collect_data_files("onnxruntime")
 datas += collect_data_files("av")
-datas += [("config.yaml", ".")]
+datas += collect_data_files("sentence_transformers")
+datas += collect_data_files("silero_vad")
+datas += [("config.yaml", "."), ("meeting/meeting_config.yaml", "meeting")]
 
 binaries = []
 binaries += collect_dynamic_libs("ctranslate2")
@@ -36,10 +44,9 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         "tkinter", "matplotlib", "pytest", "IPython", "jupyter", "notebook",
-        "torch", "torchaudio", "torchvision",
+        "torchvision",
         "llvmlite", "numba",
-        "scipy", "pandas",
-        "transformers",
+        "pandas",
         "cv2",
         "PIL", "Pillow",
     ],
