@@ -37,6 +37,7 @@ STATE_COLORS = {
 
 class OrbOverlay(QWidget):
     quit_requested = Signal()
+    meeting_toggle_requested = Signal()
 
     LABEL_H = 26
     LABEL_MARGIN = 6
@@ -264,7 +265,21 @@ class OrbOverlay(QWidget):
         status.setEnabled(False)
         menu.addAction(status)
         menu.addSeparator()
+        meeting_label = "Parar reunião" if getattr(self, "_meeting_active", False) else "Iniciar reunião"
+        self.start_meeting_action = QAction(meeting_label, self)
+        self.start_meeting_action.triggered.connect(self.meeting_toggle_requested.emit)
+        menu.addAction(self.start_meeting_action)
+        menu.addSeparator()
         quit_action = QAction("Sair", self)
         quit_action.triggered.connect(self.quit_requested.emit)
         menu.addAction(quit_action)
         menu.exec(event.globalPos())
+
+    def set_meeting_active(self, active: bool) -> None:
+        if hasattr(self, "start_meeting_action"):
+            self.start_meeting_action.setText("Parar reunião" if active else "Iniciar reunião")
+        self._meeting_active = active
+
+    @property
+    def meeting_active(self) -> bool:
+        return getattr(self, "_meeting_active", False)

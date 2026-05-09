@@ -44,6 +44,9 @@ class SussurroApp(QObject):
             level_provider=lambda: self.recorder.level,
         )
         self.overlay.quit_requested.connect(self._quit)
+        self.overlay.meeting_toggle_requested.connect(self._toggle_meeting)
+        self._meeting_controller = None
+        self._meeting_window = None
         self.overlay.show()
 
         self.state_changed.connect(self._apply_state_on_ui, Qt.ConnectionType.QueuedConnection)
@@ -188,7 +191,141 @@ class SussurroApp(QObject):
         finally:
             self._busy = False
 
+    def _toggle_meeting(self) -> None:
+        if self._meeting_controller is None or self._meeting_controller.state.value == "stopped":
+            self._start_meeting()
+        else:
+            self._stop_meeting()
+
+    def _start_meeting(self) -> None:
+        from pathlib import Path
+        import yaml
+
+        from meeting.audio.mic_capture import MicCapture
+        from meeting.audio.system_capture import SystemCapture
+        from meeting.controller import MeetingController, MeetingDeps
+        from meeting.intelligence.classifier import Classifier
+        from meeting.intelligence.llm_client import LlmClient, LlmConfig
+        from meeting.intelligence.question_detector import QuestionDetector
+        from meeting.intelligence.rag.indexer import RagIndexer
+        from meeting.intelligence.rag.retriever import RagRetriever
+        from meeting.intelligence.responder import Responder
+        from meeting.intelligence.summarizer import Summarizer
+        from meeting.persistence.session_writer import SessionWriter
+        from meeting.transcribe.adapter import MeetingTranscriber
+        from meeting.transcribe.pipeline import TranscribePipeline
+        from meeting.ui.live_window import LiveWindow
+
+        cfg_path = Path(__file__).resolve().parent.parent / "meeting" / "meeting_config.yaml"
+        config = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+        transcriber = MeetingTranscriber(
+            model_size=config["transcribe"]["model"],
+            language=config["transcribe"]["language"],
+            download_root=Path("models"),
+        )
+        pipeline = TranscribePipeline(
+            transcriber=transcriber,
+            on_turn=lambda t: None,  # rebound below after controller exists
+            workers=config["transcribe"]["parallel_workers"],
+        )
+        llm_main = LlmClient(LlmConfig(
+            provider=config["llm"]["provider"],
+            model=config["llm"]["model"],
+            api_key_env=config["llm"]["api_key_env"],
+            local_model_path=config["llm"].get("local", {}).get("model_path"),
+        ))
+        llm_classifier = LlmClient(LlmConfig(
+            provider=config["llm"]["provider"],
+            model=config["llm"]["classifier_model"],
+            api_key_env=config["llm"]["api_key_env"],
+            max_tokens=4,
+        ))
+
+        from sentence_transformers import SentenceTransformer
+        embedder = SentenceTransformer(config["rag"]["embedding_model"])
+        indexer = RagIndexer(
+            knowledge_dir=Path(config["rag"]["knowledge_dir"]),
+            embedder=embedder,
+            chunk_size=config["rag"]["chunk_size"],
+            overlap=config["rag"]["chunk_overlap"],
+        )
+        indexer.build_or_load()
+        retriever = RagRetriever(indexer.chunks, embedder)
+        classifier = Classifier(llm=llm_classifier, model=config["llm"]["classifier_model"])
+        responder = Responder(
+            retriever=retriever,
+            classifier=classifier.classify,
+            llm=llm_main,
+            model=config["llm"]["model"],
+            top_k=config["rag"]["top_k"],
+        )
+        summarizer = Summarizer(llm=llm_main, model=config["llm"]["model"])
+
+        self._meeting_window = LiveWindow(opacity=config["ui"]["opacity"])
+        self._meeting_window.show()
+
+        deps = MeetingDeps(
+            mic_capture=MicCapture(),
+            system_capture=SystemCapture(),
+            pipeline=pipeline,
+            responder=responder,
+            summarizer=summarizer,
+            session_writer_factory=lambda sid: SessionWriter(
+                root=Path(config["storage"]["output_dir"]),
+                session_id=sid,
+            ),
+            live_window=self._meeting_window,
+            question_detector=QuestionDetector(),
+            config=config,
+        )
+        self._meeting_controller = MeetingController(deps)
+        pipeline.on_turn = self._meeting_controller._on_turn  # rewire pipeline output
+
+        self._meeting_window.pause_requested.connect(self._noop)
+        self._meeting_window.stop_requested.connect(self._stop_meeting)
+        self._meeting_window.force_suggest_requested.connect(self._force_suggest)
+
+        self._meeting_controller.start()
+        self.overlay.set_meeting_active(True)
+
+    def _force_suggest(self) -> None:
+        if self._meeting_controller is None:
+            return
+        last_them = next(
+            (t for t in reversed(self._meeting_controller._turns) if t.speaker.value == "Eles"),
+            None,
+        )
+        if last_them is None:
+            return
+        threading.Thread(
+            target=self._meeting_controller._respond_async, args=(last_them,), daemon=True
+        ).start()
+
+    def _stop_meeting(self) -> None:
+        if self._meeting_controller is not None:
+            try:
+                self._meeting_controller.stop()
+            except Exception:
+                traceback.print_exc()
+            self._meeting_controller = None
+        if self._meeting_window is not None:
+            try:
+                self._meeting_window.close()
+            except Exception:
+                pass
+            self._meeting_window = None
+        self.overlay.set_meeting_active(False)
+
+    def _noop(self) -> None:
+        pass
+
     def _quit(self) -> None:
+        try:
+            if self._meeting_controller is not None:
+                self._stop_meeting()
+        except Exception:
+            pass
         try:
             self.hotkey.stop()
         except Exception:
