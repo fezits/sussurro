@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -28,6 +32,7 @@ class LiveWindow(QWidget):
     pause_requested = Signal()
     stop_requested = Signal()
     force_suggest_requested = Signal()
+    closed = Signal()
 
     def __init__(self, opacity: float = 0.92) -> None:
         flags = Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
@@ -90,6 +95,8 @@ class LiveWindow(QWidget):
         self._dismiss_timer = QTimer(self)
         self._dismiss_timer.setSingleShot(True)
         self._dismiss_timer.timeout.connect(self._dismiss_current)
+        self._status_label: QLabel | None = None
+        self._final_panel: QFrame | None = None
 
     def append_turn(self, turn: Turn) -> None:
         self.transcript.append_turn(turn)
@@ -102,6 +109,111 @@ class LiveWindow(QWidget):
         self._suggestions_holder.addWidget(card)
         self._current_card = card
         self._dismiss_timer.start(ttl_seconds * 1000)
+
+    def show_finalization_status(self, message: str) -> None:
+        """Show a status bar at the top while stop() is running (transcribing
+        remaining turns, summarizing, saving). Replaces any current suggestion
+        card with a non-dismissable progress label.
+        """
+        self._dismiss_current()
+        if self._final_panel is not None:
+            try:
+                self._final_panel.deleteLater()
+            except Exception:
+                pass
+            self._final_panel = None
+        if self._status_label is None:
+            self._status_label = QLabel(message)
+            self._status_label.setStyleSheet(
+                "QLabel { background-color: rgba(80,120,200,230); color: white; "
+                "padding: 10px 14px; border-radius: 10px; font-weight: bold; }"
+            )
+            self._suggestions_holder.addWidget(self._status_label)
+        else:
+            self._status_label.setText(message)
+
+    def show_finalization_complete(self, session_dir: Path, files: dict[str, Path]) -> None:
+        """Replace the live UI with a 'meeting saved' panel showing the
+        generated files. Buttons: open folder, open transcript, close window.
+        """
+        if self._status_label is not None:
+            try: self._status_label.deleteLater()
+            except Exception: pass
+            self._status_label = None
+
+        panel = QFrame()
+        panel.setStyleSheet(
+            "QFrame { background-color: rgba(40, 120, 70, 230); border-radius: 10px; } "
+            "QLabel { color: white; } "
+            "QPushButton { background-color: rgba(255,255,255,30); color: white; "
+            "padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,80); }"
+        )
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        title = QLabel("✅  Reunião salva")
+        title.setStyleSheet("font-weight: bold; font-size: 14px; color: white;")
+        layout.addWidget(title)
+
+        path_label = QLabel(f"<small>{session_dir}</small>")
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        path_label.setStyleSheet("color: #C8E6C9;")
+        layout.addWidget(path_label)
+
+        for name, path in files.items():
+            row = QHBoxLayout()
+            label = QLabel(f"  • <b>{name}</b>")
+            label.setStyleSheet("color: white;")
+            row.addWidget(label, 1)
+            if path.exists():
+                size_kb = path.stat().st_size / 1024
+                size_lbl = QLabel(f"<small>{size_kb:,.1f} KB</small>")
+                size_lbl.setStyleSheet("color: #C8E6C9;")
+                row.addWidget(size_lbl)
+            else:
+                missing = QLabel("<small>(não gerado)</small>")
+                missing.setStyleSheet("color: #FFCDD2;")
+                row.addWidget(missing)
+            layout.addLayout(row)
+
+        buttons = QHBoxLayout()
+        open_folder_btn = QPushButton("📂 Abrir pasta")
+        open_folder_btn.clicked.connect(lambda: self._open_path(session_dir))
+        buttons.addWidget(open_folder_btn)
+
+        transcript_path = files.get("transcript.txt")
+        if transcript_path and transcript_path.exists():
+            open_t_btn = QPushButton("📄 Abrir transcript")
+            open_t_btn.clicked.connect(lambda: self._open_path(transcript_path))
+            buttons.addWidget(open_t_btn)
+
+        summary_path = files.get("sumario.md")
+        if summary_path and summary_path.exists():
+            open_s_btn = QPushButton("📝 Abrir sumário")
+            open_s_btn.clicked.connect(lambda: self._open_path(summary_path))
+            buttons.addWidget(open_s_btn)
+
+        buttons.addStretch(1)
+        close_btn = QPushButton("✕ Fechar")
+        close_btn.clicked.connect(self.close)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self._final_panel = panel
+        self._suggestions_holder.addWidget(panel)
+
+    @staticmethod
+    def _open_path(path: Path) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception:
+            pass
 
     def _copy_to_clipboard(self, text: str) -> None:
         QApplication.clipboard().setText(text)
@@ -144,6 +256,12 @@ class LiveWindow(QWidget):
                 json.dumps({"x": geom.x(), "y": geom.y(), "w": geom.width(), "h": geom.height()}),
                 encoding="utf-8",
             )
+        except Exception:
+            pass
+        # Tell the app the user closed the window so it can clear references
+        # without trying to call close() again.
+        try:
+            self.closed.emit()
         except Exception:
             pass
         super().closeEvent(event)

@@ -57,21 +57,48 @@ Pipeline._work(audio) → Transcriber.transcribe → Turn(...) → MeetingContro
 clique "Parar" / Ctrl+Q
    │
    ▼
-SussurroApp._stop_meeting()                            [src/app.py:380]
-   └─ MeetingController.stop()                         [meeting/controller.py:71]
-      ├─ MicCapture.close()                            → fecha stream
-      ├─ SystemCapture.close()                         → fecha loopback
-      ├─ ChannelBuffer.on_turn_end() × 2               → flush do áudio restante
-      ├─ TranscribePipeline.stop()                     → drena fila + shutdown pool
-      ├─ Summarizer.summarize(self._turns)             → chama LLM, devolve markdown
-      └─ SessionWriter.finalize(summary=...)           → grava sumario.md, fecha thread
+SussurroApp._stop_meeting()                            [src/app.py:411]
+   │  (dispara thread; UI segue responsiva)
+   ├─ overlay.set_meeting_active(False)                → menu volta a "Iniciar reunião"
+   ├─ LiveWindow.show_finalization_status(msg)         → barra azul no topo da janela
+   └─ Thread worker → MeetingController.stop(on_progress=...)
+                                                       [meeting/controller.py:71]
+         emite "Fechando microfone…"                   → UI atualiza
+         ├─ MicCapture.close()
+         emite "Fechando captura do sistema…"
+         ├─ SystemCapture.close()
+         emite "Finalizando áudio pendente…"
+         ├─ ChannelBuffer.on_turn_end() × 2            → flush do áudio restante
+         emite "Transcrevendo trechos finais…"
+         ├─ TranscribePipeline.stop()                  → drena fila + shutdown pool
+         emite "Gerando sumário com LLM…"
+         ├─ Summarizer.summarize(self._turns)          → chama LLM, devolve markdown
+         emite "Salvando arquivos…"
+         └─ SessionWriter.finalize(summary=...)        → grava sumario.md
+         retorna {session_dir, files, n_turns}
 
-LiveWindow.close()                                     → salva geometria em .window_state.json
-overlay.set_meeting_active(False)                      → menu volta a "Iniciar reunião"
+   ▼ (signal Qt → UI thread)
+SussurroApp._on_meeting_stop_finished(result)
+   └─ LiveWindow.show_finalization_complete(dir, files)
+                                                       → painel verde "Reunião salva"
+                                                          com tamanho de cada arquivo
+                                                          + botões: Abrir pasta, Abrir
+                                                          transcript, Abrir sumário, Fechar
 state = STOPPED
+   (janela permanece aberta; usuário fecha quando quiser)
+
+clique no "✕ Fechar" do painel verde (ou X da janela)
+   │
+   ▼
+LiveWindow.closeEvent
+   ├─ salva geometria em meeting/.window_state.json
+   └─ emite Signal closed
+SussurroApp._on_live_window_closed
+   └─ self._meeting_window = None
+       (o app continua rodando — bolinha mantém o app vivo)
 ```
 
-**Resumo do "Parar reunião" em uma frase:** fecha as duas capturas de áudio, esvazia o buffer pendente, encerra o pool de transcrição, manda a transcrição completa pro LLM gerar o sumário, salva `transcript.txt` (que já vinha sendo escrito em tempo real) + `sumario.md` em `reunioes/<timestamp>/`, e fecha a janela ao vivo.
+**Resumo do "Parar reunião" em uma frase:** roda a finalização em background (transcreve o que sobrou, pede sumário ao LLM, grava `transcript.txt` + `sumario.md` em `reunioes/<timestamp>/`), atualiza a janela ao vivo a cada etapa, e quando termina mostra um painel verde com o caminho dos arquivos e botões pra abri-los. A janela **não fecha sozinha** — você fecha quando quiser. O app continua rodando.
 
 **Onde está cada artefato ao final:**
 - `reunioes/<YYYY-MM-DD_HH-MM>/transcript.txt` — diálogo completo com timestamps
@@ -102,7 +129,10 @@ state = STOPPED
 - **`_toggle_meeting()`** [src/app.py:194] — Item de menu "Iniciar/Parar reunião". Encapsula `_start_meeting` num try/except que loga falha e mostra erro na bolinha.
 - **`_start_meeting()`** [src/app.py:209] — Carrega `meeting_config.yaml`, valida `GROQ_API_KEY`, monta `MeetingTranscriber` + `LlmClient` × 2 + `SentenceTransformer` + `RagIndexer/Retriever` + `Responder` + `Summarizer` + `LiveWindow` + `MicCapture` + `SystemCapture` + `MeetingController`. Chama `controller.start()`.
 - **`_force_suggest()`** [src/app.py:355] — Pega o último turn `[Eles]` e dispara `responder.respond` numa thread (botão "Forçar sugestão" da janela).
-- **`_stop_meeting()`** [src/app.py:368] — Chama `MeetingController.stop()`, fecha `LiveWindow`, restaura menu.
+- **`_stop_meeting()`** [src/app.py:411] — Dispara `controller.stop(on_progress=callback)` em thread separada; **não fecha a janela**. Conectado via `meeting_stop_progress` e `meeting_stop_finished` (signals Qt).
+- **`_on_meeting_stop_progress(msg)`** — Slot do signal; chama `live_window.show_finalization_status(msg)` e atualiza o label da bolinha.
+- **`_on_meeting_stop_finished(result)`** — Slot final; quando `result` tem `session_dir`, chama `live_window.show_finalization_complete(...)` mostrando painel verde com botões. Quando vazio, fecha janela.
+- **`_on_live_window_closed()`** — Slot do signal `LiveWindow.closed`; só zera `self._meeting_window`. O app continua rodando.
 - **`_quit()`** [src/app.py:386] — Para reunião se ativa, para hotkey, fecha recorder, encerra Qt.
 
 ### `src/overlay.py` — Bolinha flutuante (`OrbOverlay`)
@@ -253,7 +283,10 @@ state = STOPPED
 ### `meeting/ui/live_window.py`
 - **`LiveWindow.__init__(opacity=0.92)`** — Cria QWidget sempre-no-topo, monta layout (header + suggestion_holder + transcript + bottom). Restaura geometria de `.window_state.json`. Aplica invisibility via `QTimer.singleShot(0, ...)` depois que `winId()` é válido.
 - **`append_turn(turn)`** — Repassa pro `TranscriptView`.
-- **`show_suggestion(suggestion, ttl_seconds)`** [meeting/ui/live_window.py:81] — Remove card atual, cria novo, conecta sinais, dispara timer pra auto-dismiss.
+- **`show_suggestion(suggestion, ttl_seconds)`** [meeting/ui/live_window.py:99] — Remove card atual, cria novo, conecta sinais, dispara timer pra auto-dismiss.
+- **`show_finalization_status(message)`** — Mostra barra azul fixa no topo durante o `stop()` (não-dismissable). Substitui qualquer suggestion card ativa.
+- **`show_finalization_complete(session_dir, files)`** — Substitui a barra por um painel verde "Reunião salva" listando cada arquivo (com tamanho em KB) e botões "Abrir pasta", "Abrir transcript", "Abrir sumário", "Fechar". Os botões abrem via `os.startfile` no Windows.
+- **`closed`** (Signal) — Emitido em `closeEvent` para o app saber que a janela foi fechada pelo usuário.
 - **`_copy_to_clipboard(text)`** — `QApplication.clipboard().setText(text)`, dismiss.
 - **`_apply_invisibility()`** — Chama o helper de `meeting/ui/invisibility.py`.
 - **`closeEvent`** — Salva geometria em `meeting/.window_state.json`.
@@ -263,15 +296,15 @@ state = STOPPED
 - **`MeetingDeps`** — Dataclass agrupando todas dependências injetadas (testabilidade).
 - **`MeetingController.__init__(deps)`** — Cria 2 `Vad` + 2 `ChannelBuffer` (`_buf_them` `_buf_you`), inicializa `_turns=[]`, `_recent_them_audio=deque(maxlen=10)`.
 - **`start()`** [meeting/controller.py:55] — Cria SessionWriter via factory, inicia. Sobe pipeline. Conecta `on_audio` dos capturers em `_on_mic_audio`/`_on_sys_audio`. Abre capturers. Estado → RECORDING.
-- **`stop()`** [meeting/controller.py:71] — Sequência exata (todos try/except: nenhum erro impede o resto):
-  1. `mic_capture.close()`
-  2. `system_capture.close()`
-  3. `_buf_them.on_turn_end()` — flush
-  4. `_buf_you.on_turn_end()` — flush
-  5. `pipeline.stop()` — drena fila + shutdown pool
-  6. `summarizer.summarize(self._turns)` — chama LLM
-  7. `writer.finalize(summary=...)` — grava `sumario.md`
-  8. Estado → STOPPED.
+- **`stop(on_progress=None)`** [meeting/controller.py:71] — Aceita callback `on_progress(msg)` para reportar etapa atual em pt-BR (UI mostra). Sequência (todos try/except: nenhum erro impede o resto):
+  1. "Fechando microfone…" → `mic_capture.close()`
+  2. "Fechando captura do sistema…" → `system_capture.close()`
+  3. "Finalizando áudio pendente…" → `_buf_them.on_turn_end()` + `_buf_you.on_turn_end()`
+  4. "Transcrevendo trechos finais…" → `pipeline.stop()`
+  5. "Gerando sumário com LLM…" → `summarizer.summarize(self._turns)`
+  6. "Salvando arquivos…" → `writer.finalize(summary=...)`
+  7. Estado → STOPPED.
+  Retorna `dict {session_dir, files, n_turns}` ou `None` se nunca rodou.
 - **`_on_mic_audio(chunk)`** — Alimenta `_buf_you` e `_vad_you`; on turn_end → flush buffer.
 - **`_on_sys_audio(chunk)`** — Mesmo pra `_buf_them` + `_vad_them` + guarda os últimos chunks em `_recent_them_audio` (pra prosódia).
 - **`_on_chunk(speaker, audio)`** — Submetida ao pipeline.

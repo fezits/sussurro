@@ -50,6 +50,13 @@ class SussurroApp(QObject):
         self.overlay.meeting_toggle_requested.connect(self._toggle_meeting)
         self._meeting_controller = None
         self._meeting_window = None
+        self._stopping_meeting = False
+        self.meeting_stop_progress.connect(
+            self._on_meeting_stop_progress, Qt.ConnectionType.QueuedConnection
+        )
+        self.meeting_stop_finished.connect(
+            self._on_meeting_stop_finished, Qt.ConnectionType.QueuedConnection
+        )
         self.overlay.show()
 
         self.state_changed.connect(self._apply_state_on_ui, Qt.ConnectionType.QueuedConnection)
@@ -343,6 +350,7 @@ class SussurroApp(QObject):
 
         log.info("Opening LiveWindow")
         self._meeting_window = LiveWindow(opacity=config["ui"]["opacity"])
+        self._meeting_window.closed.connect(self._on_live_window_closed)
         self._meeting_window.show()
 
         log.info("Building audio captures")
@@ -397,20 +405,82 @@ class SussurroApp(QObject):
             target=self._meeting_controller._respond_async, args=(last_them,), daemon=True
         ).start()
 
+    # Signals to marshal stop() progress back to the UI thread.
+    meeting_stop_progress = Signal(str)
+    meeting_stop_finished = Signal(object)  # dict | None
+
     def _stop_meeting(self) -> None:
-        if self._meeting_controller is not None:
-            try:
-                self._meeting_controller.stop()
-            except Exception:
-                traceback.print_exc()
-            self._meeting_controller = None
-        if self._meeting_window is not None:
-            try:
-                self._meeting_window.close()
-            except Exception:
-                pass
-            self._meeting_window = None
+        """Stop the meeting WITHOUT closing the app or the live window.
+        Runs the slow finalization (Whisper draining, LLM summary, file
+        write) in a background thread and reports progress to the live
+        window. The user closes the window themselves when ready.
+        """
+        if self._meeting_controller is None:
+            return
+        if self._stopping_meeting:
+            log.debug("Stop already in progress; ignoring")
+            return
+        self._stopping_meeting = True
+
+        controller = self._meeting_controller
+        window = self._meeting_window
+        log.info("Stopping meeting…")
         self.overlay.set_meeting_active(False)
+        self._set_state(OverlayState.TRANSCRIBING, "Finalizando reunião…")
+
+        if window is not None:
+            try: window.show_finalization_status("Finalizando reunião…")
+            except Exception: pass
+
+        def progress(msg: str) -> None:
+            self.meeting_stop_progress.emit(msg)
+
+        def worker() -> None:
+            result = None
+            try:
+                result = controller.stop(on_progress=progress)
+            except Exception:
+                log.exception("Falha em controller.stop")
+            self.meeting_stop_finished.emit(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_meeting_stop_progress(self, msg: str) -> None:
+        log.info("stop progress · %s", msg)
+        if self._meeting_window is not None:
+            try: self._meeting_window.show_finalization_status(msg)
+            except Exception: pass
+        self._set_state(OverlayState.TRANSCRIBING, msg)
+
+    def _on_live_window_closed(self) -> None:
+        """Called when the user closes the LiveWindow via the X button or
+        the 'Fechar' button on the finalization panel. We just drop our
+        reference — Qt is already destroying the widget. The bubble overlay
+        keeps the app alive."""
+        log.info("LiveWindow closed by user")
+        self._meeting_window = None
+
+    def _on_meeting_stop_finished(self, result) -> None:
+        log.info("Meeting stop finished · result=%s", result)
+        self._stopping_meeting = False
+        self._meeting_controller = None
+
+        if isinstance(result, dict) and result.get("session_dir"):
+            session_dir = result["session_dir"]
+            files = result["files"]
+            n_turns = result.get("n_turns", 0)
+            if self._meeting_window is not None:
+                try:
+                    self._meeting_window.show_finalization_complete(session_dir, files)
+                except Exception:
+                    log.exception("Failed showing finalization panel")
+            self._set_state(OverlayState.IDLE, f"✓ {n_turns} turnos · salvo em {session_dir.name}")
+        else:
+            self._set_state(OverlayState.IDLE, "Reunião encerrada (sem arquivos)")
+            if self._meeting_window is not None:
+                try: self._meeting_window.close()
+                except Exception: pass
+                self._meeting_window = None
 
     def _noop(self) -> None:
         pass

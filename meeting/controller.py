@@ -67,43 +67,70 @@ class MeetingController:
 
         self.state = MeetingState.RECORDING
 
-    def stop(self) -> None:
-        if self.state is MeetingState.STOPPED:
-            return
-        try:
-            self.deps.mic_capture.close()
-        except Exception:
-            pass
-        try:
-            self.deps.system_capture.close()
-        except Exception:
-            pass
-        # flush remaining audio in buffers
-        try:
-            self._buf_them.on_turn_end()
-        except Exception:
-            pass
-        try:
-            self._buf_you.on_turn_end()
-        except Exception:
-            pass
-        try:
-            self.deps.pipeline.stop()
-        except Exception:
-            pass
+    def stop(self, on_progress: "Callable[[str], None] | None" = None) -> "dict | None":
+        """Encerra a reunião. Etapas síncronas:
+          1. fecha capturas, 2. flush buffers, 3. drena pipeline, 4. transcreve
+          o que sobrou, 5. gera sumário via LLM, 6. grava sumario.md.
 
+        Retorna dict com info da sessão (dir + arquivos) ou None se nunca rodou.
+        Se on_progress for passado, é chamado a cada etapa com mensagem em pt-BR.
+        """
+        if self.state is MeetingState.STOPPED:
+            return None
+
+        def progress(msg: str) -> None:
+            if on_progress is not None:
+                try:
+                    on_progress(msg)
+                except Exception:
+                    pass
+
+        progress("Fechando microfone…")
+        try: self.deps.mic_capture.close()
+        except Exception: pass
+
+        progress("Fechando captura do sistema…")
+        try: self.deps.system_capture.close()
+        except Exception: pass
+
+        progress("Finalizando áudio pendente…")
+        try: self._buf_them.on_turn_end()
+        except Exception: pass
+        try: self._buf_you.on_turn_end()
+        except Exception: pass
+
+        progress("Transcrevendo trechos finais…")
+        try: self.deps.pipeline.stop()
+        except Exception: pass
+
+        progress("Gerando sumário com LLM…")
         try:
             summary = self.deps.summarizer.summarize(self._turns)
         except Exception as e:
             summary = f"## Resumo\n_Falha ao gerar sumário: {e}_\n"
 
+        progress("Salvando arquivos…")
+        session_dir = None
         if self._writer is not None:
             try:
                 self._writer.finalize(summary=summary)
+                session_dir = self._writer.dir
             except Exception:
                 pass
 
         self.state = MeetingState.STOPPED
+
+        if session_dir is None:
+            return None
+
+        return {
+            "session_dir": session_dir,
+            "files": {
+                "transcript.txt": session_dir / "transcript.txt",
+                "sumario.md": session_dir / "sumario.md",
+            },
+            "n_turns": len(self._turns),
+        }
 
     # ---- audio callbacks ----
 
