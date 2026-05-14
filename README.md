@@ -2,6 +2,8 @@
 
 Clone pessoal do Wispr Flow. Segure `Ctrl+Windows`, fale, solte — a transcrição aparece onde seu cursor estiver. 100% local, usa `faster-whisper`.
 
+> **Documentação técnica:** [ARCHITECTURE.md](ARCHITECTURE.md) tem o mapa de cada função do sistema, lifecycle de "Iniciar/Parar reunião", e onde cada artefato é gravado.
+
 ## Requisitos
 
 - Windows 10/11
