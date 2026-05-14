@@ -11,12 +11,15 @@ import yaml
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import QApplication
 
+from src import logger as sussurro_logger
 from src.download_monitor import DownloadMonitor, is_model_complete
 from src.hotkey import PressToTalk
 from src.injector import paste_text
 from src.overlay import OrbOverlay, OverlayState
 from src.recorder import Recorder
 from src.transcriber import Transcriber
+
+log = sussurro_logger.get("app")
 
 
 MIN_RECORDING_SECONDS = 0.25
@@ -192,13 +195,33 @@ class SussurroApp(QObject):
             self._busy = False
 
     def _toggle_meeting(self) -> None:
+        log.info("Meeting toggle requested · controller=%s", self._meeting_controller)
         if self._meeting_controller is None or self._meeting_controller.state.value == "stopped":
-            self._start_meeting()
+            try:
+                self._start_meeting()
+            except Exception as e:
+                log.exception("Falha em _start_meeting")
+                short = str(e).split("\n", 1)[0][:120] or e.__class__.__name__
+                self._set_state(OverlayState.ERROR, f"Reunião: {short}")
+                # If the LiveWindow was opened before the failure, close it.
+                if self._meeting_window is not None:
+                    try: self._meeting_window.close()
+                    except Exception: pass
+                    self._meeting_window = None
+                if self._meeting_controller is not None:
+                    try: self._meeting_controller.stop()
+                    except Exception: pass
+                    self._meeting_controller = None
+                self.overlay.set_meeting_active(False)
         else:
             self._stop_meeting()
 
     def _start_meeting(self) -> None:
+        log.info("--- Starting meeting mode ---")
+
+        log.debug("Importing meeting modules...")
         from pathlib import Path
+        import os
         import yaml
 
         from meeting.audio.mic_capture import MicCapture
@@ -215,42 +238,98 @@ class SussurroApp(QObject):
         from meeting.transcribe.adapter import MeetingTranscriber
         from meeting.transcribe.pipeline import TranscribePipeline
         from meeting.ui.live_window import LiveWindow
+        log.debug("Imports OK")
 
-        cfg_path = Path(__file__).resolve().parent.parent / "meeting" / "meeting_config.yaml"
+        # Resolve config + paths (same logic as Whisper model resolution)
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).resolve().parent
+        else:
+            base = Path(__file__).resolve().parent.parent
+
+        # PyInstaller bundles datas under _internal/, but writable user paths
+        # (models/, knowledge/, reunioes/) live next to the exe. Try both.
+        cfg_candidates = [
+            base / "meeting" / "meeting_config.yaml",
+            base / "_internal" / "meeting" / "meeting_config.yaml",
+        ]
+        cfg_path = next((p for p in cfg_candidates if p.exists()), cfg_candidates[0])
+        log.info("Loading meeting config from %s", cfg_path)
         config = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        log.debug("Config: %s", config)
 
+        # Validate API key early
+        api_key_env = config["llm"]["api_key_env"]
+        if not os.environ.get(api_key_env, "").strip():
+            raise RuntimeError(
+                f"Variável de ambiente {api_key_env} não definida. "
+                f"Configure no Windows: setx {api_key_env} \"<sua-chave>\" e reinicie."
+            )
+        log.info("API key %s detected (length=%d)", api_key_env, len(os.environ[api_key_env]))
+
+        models_dir = base / config.get("transcribe", {}).get("model_dir", "models")
+        knowledge_dir = base / config["rag"]["knowledge_dir"]
+        output_dir = base / config["storage"]["output_dir"]
+        log.info("Paths · models=%s · knowledge=%s · output=%s", models_dir, knowledge_dir, output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # First-run: scaffold knowledge/ next to the exe so the user can edit it.
+        if not knowledge_dir.exists():
+            log.info("First run · creating knowledge dir + perfil.md template")
+            knowledge_dir.mkdir(parents=True, exist_ok=True)
+            (knowledge_dir / "perfil.md").write_text(
+                "# Meu perfil\n\nEdite este arquivo livremente.\n"
+                "O Sussurro usa o conteúdo como contexto pra responder perguntas sobre você.\n",
+                encoding="utf-8",
+            )
+
+        self._set_state(OverlayState.LOADING, "Carregando Whisper…")
+        log.info("Building MeetingTranscriber (model=%s)", config["transcribe"]["model"])
         transcriber = MeetingTranscriber(
             model_size=config["transcribe"]["model"],
             language=config["transcribe"]["language"],
-            download_root=Path("models"),
+            download_root=models_dir,
         )
+        log.info("MeetingTranscriber ready · device=%s", transcriber.device)
+
         pipeline = TranscribePipeline(
             transcriber=transcriber,
-            on_turn=lambda t: None,  # rebound below after controller exists
+            on_turn=lambda t: None,
             workers=config["transcribe"]["parallel_workers"],
         )
+
+        log.info("Building LLM clients (provider=%s, model=%s)", config["llm"]["provider"], config["llm"]["model"])
         llm_main = LlmClient(LlmConfig(
             provider=config["llm"]["provider"],
             model=config["llm"]["model"],
-            api_key_env=config["llm"]["api_key_env"],
+            api_key_env=api_key_env,
             local_model_path=config["llm"].get("local", {}).get("model_path"),
         ))
         llm_classifier = LlmClient(LlmConfig(
             provider=config["llm"]["provider"],
             model=config["llm"]["classifier_model"],
-            api_key_env=config["llm"]["api_key_env"],
+            api_key_env=api_key_env,
             max_tokens=4,
         ))
 
+        self._set_state(OverlayState.LOADING, "Carregando embeddings…")
+        log.info("Loading SentenceTransformer (%s)", config["rag"]["embedding_model"])
         from sentence_transformers import SentenceTransformer
         embedder = SentenceTransformer(config["rag"]["embedding_model"])
+        log.info("Embedder ready")
+
+        log.info("Indexing knowledge dir %s", knowledge_dir)
         indexer = RagIndexer(
-            knowledge_dir=Path(config["rag"]["knowledge_dir"]),
+            knowledge_dir=knowledge_dir,
             embedder=embedder,
             chunk_size=config["rag"]["chunk_size"],
             overlap=config["rag"]["chunk_overlap"],
         )
-        indexer.build_or_load()
+        try:
+            n_chunks = indexer.build_or_load()
+            log.info("RAG index ready · %d chunks (cached=%s)", n_chunks, indexer.was_cached_last_call)
+        except Exception:
+            log.exception("RAG indexing failed; continuing with empty index")
+            indexer.chunks = []
         retriever = RagRetriever(indexer.chunks, embedder)
         classifier = Classifier(llm=llm_classifier, model=config["llm"]["classifier_model"])
         responder = Responder(
@@ -262,17 +341,30 @@ class SussurroApp(QObject):
         )
         summarizer = Summarizer(llm=llm_main, model=config["llm"]["model"])
 
+        log.info("Opening LiveWindow")
         self._meeting_window = LiveWindow(opacity=config["ui"]["opacity"])
         self._meeting_window.show()
 
+        log.info("Building audio captures")
+        try:
+            mic = MicCapture()
+        except Exception:
+            log.exception("MicCapture init failed")
+            raise
+        try:
+            sys_cap = SystemCapture()
+        except Exception:
+            log.exception("SystemCapture init failed (WASAPI loopback unavailable?)")
+            raise
+
         deps = MeetingDeps(
-            mic_capture=MicCapture(),
-            system_capture=SystemCapture(),
+            mic_capture=mic,
+            system_capture=sys_cap,
             pipeline=pipeline,
             responder=responder,
             summarizer=summarizer,
             session_writer_factory=lambda sid: SessionWriter(
-                root=Path(config["storage"]["output_dir"]),
+                root=output_dir,
                 session_id=sid,
             ),
             live_window=self._meeting_window,
@@ -280,14 +372,17 @@ class SussurroApp(QObject):
             config=config,
         )
         self._meeting_controller = MeetingController(deps)
-        pipeline.on_turn = self._meeting_controller._on_turn  # rewire pipeline output
+        pipeline.on_turn = self._meeting_controller._on_turn
 
         self._meeting_window.pause_requested.connect(self._noop)
         self._meeting_window.stop_requested.connect(self._stop_meeting)
         self._meeting_window.force_suggest_requested.connect(self._force_suggest)
 
+        log.info("Starting MeetingController")
         self._meeting_controller.start()
         self.overlay.set_meeting_active(True)
+        self._set_state(OverlayState.RECORDING, "Reunião ativa")
+        log.info("--- Meeting mode RUNNING ---")
 
     def _force_suggest(self) -> None:
         if self._meeting_controller is None:
