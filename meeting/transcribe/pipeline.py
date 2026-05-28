@@ -11,6 +11,13 @@ import numpy as np
 
 from meeting.transcribe.turn import Speaker, Turn
 
+try:
+    from src import logger as _slog
+    log = _slog.get("pipeline")
+except Exception:
+    import logging as _logging
+    log = _logging.getLogger("sussurro.pipeline")
+
 
 class _Transcriber(Protocol):
     def transcribe(self, audio: np.ndarray) -> str: ...
@@ -70,11 +77,16 @@ class TranscribePipeline:
             self._pool.submit(self._work, speaker, audio, wall)
 
     def _work(self, speaker: Speaker, audio: np.ndarray, wall: datetime) -> None:
+        seconds = audio.size / self.sample_rate
+        log.info("Transcribing · speaker=%s · %.2fs", speaker.value, seconds)
         try:
             text = self.transcriber.transcribe(audio).strip()
         except Exception:
+            log.exception("transcriber.transcribe FAILED · speaker=%s · %.2fs", speaker.value, seconds)
             return
+        log.info("Transcribed · speaker=%s · text=%r", speaker.value, text[:120])
         if not text:
+            log.info("Empty transcription (silence/noise) · speaker=%s · %.2fs", speaker.value, seconds)
             return
         duration = audio.size / self.sample_rate
         end_seconds = (wall - self.meeting_start).total_seconds()
@@ -89,4 +101,4 @@ class TranscribePipeline:
         try:
             self.on_turn(turn)
         except Exception:
-            pass
+            log.exception("on_turn callback failed")

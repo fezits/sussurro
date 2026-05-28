@@ -14,6 +14,13 @@ from meeting.intelligence.types import Suggestion
 from meeting.state import MeetingState, SessionId
 from meeting.transcribe.turn import Speaker, Turn
 
+try:
+    from src import logger as _slog
+    log = _slog.get("controller")
+except Exception:
+    import logging as _logging
+    log = _logging.getLogger("sussurro.controller")
+
 
 @dataclass
 class MeetingDeps:
@@ -50,10 +57,21 @@ class MeetingController:
         self._recent_them_audio: deque[np.ndarray] = deque(maxlen=10)
         self._lock = threading.Lock()
 
+        # Debug counters (logged every ~5s by a daemon timer)
+        self._dbg = {
+            "mic_chunks": 0, "mic_samples": 0,
+            "sys_chunks": 0, "sys_samples": 0,
+            "vad_you_turn_ends": 0, "vad_them_turn_ends": 0,
+            "pipeline_submits": 0,
+            "turns_emitted": 0,
+        }
+        self._dbg_timer_stop = threading.Event()
+
     # ---- lifecycle ----
 
     def start(self) -> None:
         self.session_id = SessionId.now()
+        log.info("MeetingController.start · session=%s", self.session_id.value)
         self._writer = self.deps.session_writer_factory(self.session_id)
         self._writer.start()
 
@@ -63,9 +81,30 @@ class MeetingController:
         self.deps.system_capture.on_audio = self._on_sys_audio
 
         self.deps.mic_capture.open()
+        log.info("Mic capture opened")
         self.deps.system_capture.open()
+        log.info("System capture opened")
 
         self.state = MeetingState.RECORDING
+
+        # Heartbeat: log debug counters every 5s so we can see if audio is flowing.
+        self._dbg_timer_stop.clear()
+        threading.Thread(target=self._dbg_heartbeat, daemon=True).start()
+
+    def _dbg_heartbeat(self) -> None:
+        last_snapshot = dict(self._dbg)
+        while not self._dbg_timer_stop.wait(5.0):
+            cur = dict(self._dbg)
+            delta = {k: cur[k] - last_snapshot.get(k, 0) for k in cur}
+            log.info(
+                "HEARTBEAT · mic +%d chunks (+%.1fs) · sys +%d chunks (+%.1fs) · "
+                "vad_end you=%d them=%d · submits=%d · turns=%d",
+                delta["mic_chunks"], delta["mic_samples"] / 16000,
+                delta["sys_chunks"], delta["sys_samples"] / 16000,
+                delta["vad_you_turn_ends"], delta["vad_them_turn_ends"],
+                delta["pipeline_submits"], delta["turns_emitted"],
+            )
+            last_snapshot = cur
 
     def stop(self, on_progress: "Callable[[str], None] | None" = None) -> "dict | None":
         """Encerra a reunião. Etapas síncronas:
@@ -77,6 +116,16 @@ class MeetingController:
         """
         if self.state is MeetingState.STOPPED:
             return None
+
+        self._dbg_timer_stop.set()
+        log.info(
+            "Final counters · mic=%d chunks/%.1fs · sys=%d chunks/%.1fs · "
+            "vad_end you=%d them=%d · submits=%d · turns=%d",
+            self._dbg["mic_chunks"], self._dbg["mic_samples"] / 16000,
+            self._dbg["sys_chunks"], self._dbg["sys_samples"] / 16000,
+            self._dbg["vad_you_turn_ends"], self._dbg["vad_them_turn_ends"],
+            self._dbg["pipeline_submits"], self._dbg["turns_emitted"],
+        )
 
         def progress(msg: str) -> None:
             if on_progress is not None:
@@ -137,37 +186,55 @@ class MeetingController:
     def _on_mic_audio(self, chunk: np.ndarray) -> None:
         if self.state is not MeetingState.RECORDING:
             return
+        self._dbg["mic_chunks"] += 1
+        self._dbg["mic_samples"] += int(chunk.size)
         self._buf_you.feed_audio(chunk)
         for ev in self._vad_you.feed(chunk):
             if ev == "turn_end":
+                self._dbg["vad_you_turn_ends"] += 1
+                log.debug("VAD you turn_end")
                 self._buf_you.on_turn_end()
 
     def _on_sys_audio(self, chunk: np.ndarray) -> None:
         if self.state is not MeetingState.RECORDING:
             return
+        self._dbg["sys_chunks"] += 1
+        self._dbg["sys_samples"] += int(chunk.size)
         self._buf_them.feed_audio(chunk)
         self._recent_them_audio.append(chunk)
         for ev in self._vad_them.feed(chunk):
             if ev == "turn_end":
+                self._dbg["vad_them_turn_ends"] += 1
+                log.debug("VAD them turn_end")
                 self._buf_them.on_turn_end()
 
     def _on_chunk(self, speaker: Speaker, audio: np.ndarray) -> None:
+        self._dbg["pipeline_submits"] += 1
+        log.info(
+            "Submitting chunk to pipeline · speaker=%s · samples=%d · seconds=%.2f",
+            speaker.value, audio.size, audio.size / 16000,
+        )
         self.deps.pipeline.submit(speaker, audio)
 
     # ---- turn handling ----
 
     def _on_turn(self, turn: Turn) -> None:
+        self._dbg["turns_emitted"] += 1
+        log.info(
+            "TURN · speaker=%s · text=%r · %.2fs..%.2fs",
+            turn.speaker.value, turn.text[:120], turn.start, turn.end,
+        )
         with self._lock:
             self._turns.append(turn)
         if self._writer is not None:
             try:
                 self._writer.append_turn(turn)
             except Exception:
-                pass
+                log.exception("writer.append_turn failed")
         try:
             self.deps.live_window.append_turn(turn)
         except Exception:
-            pass
+            log.exception("live_window.append_turn failed")
 
         if turn.speaker is Speaker.THEM and self.deps.config.get("intelligence", {}).get("question_detection", True):
             tail = np.concatenate(list(self._recent_them_audio)) if self._recent_them_audio else None
