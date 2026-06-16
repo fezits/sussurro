@@ -129,6 +129,8 @@ SussurroApp._on_live_window_closed
 - **`_toggle_meeting()`** [src/app.py:194] — Item de menu "Iniciar/Parar reunião". Encapsula `_start_meeting` num try/except que loga falha e mostra erro na bolinha.
 - **`_start_meeting()`** [src/app.py:209] — Carrega `meeting_config.yaml`, valida `GROQ_API_KEY`, monta `MeetingTranscriber` + `LlmClient` × 2 + `SentenceTransformer` + `RagIndexer/Retriever` + `Responder` + `Summarizer` + `LiveWindow` + `MicCapture` + `SystemCapture` + `MeetingController`. Chama `controller.start()`.
 - **`_force_suggest()`** [src/app.py:355] — Pega o último turn `[Eles]` e dispara `responder.respond` numa thread (botão "Forçar sugestão" da janela).
+- **`_show_hud()`** [src/app.py] — Slot do `hud_requested` (clique esquerdo na bolinha). Lazy-cria `HudPanel`, conecta seus signals, atualiza status + meeting flag, chama `show_near` posicionando ao lado da bolinha.
+- **`_show_dashboard()`** [src/app.py] — Slot do `dashboard_requested` (botão "Reuniões anteriores" do HUD). Lazy-cria `Dashboard`, faz `refresh()`, mostra.
 - **`_transcribe_file()`** [src/app.py] — Slot do `transcribe_file_requested`. Valida que não há reunião ativa, abre `QFileDialog`, dispara worker thread.
 - **`_transcribe_file_worker(path)`** — Em background: monta deps mínimas (sem mic/loopback, sem responder/RAG), cria `LiveWindow`, instancia `MeetingController`, chama `controller.start_from_file(path, on_progress=callback)`. Quando termina, chama `_stop_meeting()` que reusa o mesmo fluxo de finalização (drain pipeline, sumário, salvar arquivos, painel verde).
 - **`_stop_meeting()`** [src/app.py:411] — Dispara `controller.stop(on_progress=callback)` em thread separada; **não fecha a janela**. Conectado via `meeting_stop_progress` e `meeting_stop_finished` (signals Qt).
@@ -137,11 +139,26 @@ SussurroApp._on_live_window_closed
 - **`_on_live_window_closed()`** — Slot do signal `LiveWindow.closed`; só zera `self._meeting_window`. O app continua rodando.
 - **`_quit()`** [src/app.py:386] — Para reunião se ativa, para hotkey, fecha recorder, encerra Qt.
 
+### `src/hud.py` — Painel de controle compacto (`HudPanel`)
+- Janela frameless arredondada que abre **ao clicar esquerdo na bolinha** (sem arrastar). Some no Esc ou ao perder foco.
+- Mostra status (Pronto/Carregando/CPU/modelo) + estado da `GROQ_API_KEY`.
+- Botões: **🎙️ Iniciar/Parar reunião** (signal `meeting_toggle_requested`), **📁 Transcrever arquivo** (`transcribe_file_requested`), **📋 Reuniões anteriores** (`dashboard_requested` → abre `Dashboard`), **📂 Pasta**, **📝 Perfil** (abre `knowledge/perfil.md`), **📊 Log** (abre `sussurro.log`), **❌ Sair**.
+- **`show_near(anchor_pos, w, h)`** — Posiciona à esquerda da bolinha (acima se não couber).
+- **`update_status(status, env_msg)`** — Texto e info de API key no header.
+- **`set_meeting_active(active)`** — Alterna texto do botão primário entre "Iniciar"/"Parar reunião".
+
+### `src/dashboard.py` — Janela de reuniões (`Dashboard`)
+- Janela autônoma 960×620 redimensionável.
+- **`scan_sessions(reunioes_dir)`** — Lê `reunioes/<YYYY-MM-DD_HH-MM>/`. Para cada pasta: conta linhas do `transcript.txt` (turnos), pega tamanho do `sumario.md`, verifica se `audio.wav` existe. Retorna `list[SessionInfo]` ordenado do mais recente.
+- UI esquerda: lista clicável das sessões com data + N turnos. Botões: ↻ recarregar, 📂 Abrir pasta, ⬇ Exportar (gera `.md` consolidado), 🗑️ excluir (com confirmação `QMessageBox`).
+- UI direita: `QTabWidget` com aba **Transcript** (`QTextEdit` read-only mostrando o `.txt`) e **Sumário** (`QTextBrowser` renderizando markdown via `setMarkdown`).
+- Footer: contagem de sessões + caminho da pasta.
+
 ### `src/overlay.py` — Bolinha flutuante (`OrbOverlay`)
 - **`OrbOverlay.__init__`** — Cria QWidget sempre-no-topo, frameless, translúcido. Timer de 30ms anima.
 - **`set_state(state, status, progress)`** [src/overlay.py:93] — Muda cor/animação da bolinha e label embaixo. Estados: IDLE, RECORDING, TRANSCRIBING, LOADING, ERROR.
 - **`paintEvent`** [src/overlay.py:106] — Desenha o orb com gradient + glow + animação interna (microfone / waveform / spinner) por estado.
-- **`mousePressEvent` / `mouseMoveEvent`** — Arrasta a bolinha.
+- **`mousePressEvent` / `mouseMoveEvent` / `mouseReleaseEvent`** — Distingue **clique simples** (movimento < 6px) de **arrastar**. Clique simples emite `hud_requested` (abre o `HudPanel`). Arrastar move a bolinha como antes.
 - **`contextMenuEvent`** [src/overlay.py:262] — Menu de clique direito: status, "Iniciar/Parar reunião" → emite `meeting_toggle_requested`, "Transcrever arquivo…" → emite `transcribe_file_requested` (desabilitado quando há reunião ativa), "Sair" → emite `quit_requested`.
 - **`set_meeting_active(active)`** [src/overlay.py:278] — Atualiza texto do item de menu.
 

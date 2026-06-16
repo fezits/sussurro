@@ -49,9 +49,12 @@ class SussurroApp(QObject):
         self.overlay.quit_requested.connect(self._quit)
         self.overlay.meeting_toggle_requested.connect(self._toggle_meeting)
         self.overlay.transcribe_file_requested.connect(self._transcribe_file)
+        self.overlay.hud_requested.connect(self._show_hud)
         self._meeting_controller = None
         self._meeting_window = None
         self._stopping_meeting = False
+        self._hud = None
+        self._dashboard = None
         self.meeting_stop_progress.connect(
             self._on_meeting_stop_progress, Qt.ConnectionType.QueuedConnection
         )
@@ -610,6 +613,50 @@ class SussurroApp(QObject):
             try: self._meeting_window.show_finalization_status(msg)
             except Exception: pass
         self._set_state(OverlayState.TRANSCRIBING, msg)
+
+    def _show_hud(self) -> None:
+        """Open the compact HUD next to the orb."""
+        from src.hud import HudPanel
+        from pathlib import Path as _P
+        if self._hud is None:
+            if getattr(sys, "frozen", False):
+                base = _P(sys.executable).resolve().parent
+            else:
+                base = _P(__file__).resolve().parent.parent
+            self._hud = HudPanel(base_dir=base)
+            self._hud.meeting_toggle_requested.connect(self._toggle_meeting)
+            self._hud.transcribe_file_requested.connect(self._transcribe_file)
+            self._hud.dashboard_requested.connect(self._show_dashboard)
+            self._hud.quit_requested.connect(self._quit)
+        # Update status before showing
+        ready = self.transcriber is not None
+        status = "Pronto" if ready else "Carregando…"
+        if ready and self.transcriber is not None:
+            status = f"Pronto · {self.transcriber.device} · {self.config['whisper']['model']}"
+        import os as _os
+        api_env = "GROQ_API_KEY"
+        has_key = bool(_os.environ.get(api_env, "").strip())
+        env_msg = f"{api_env}: {'✓ configurada' if has_key else '✗ não configurada'}"
+        self._hud.update_status(status, env_msg)
+        self._hud.set_meeting_active(self._meeting_controller is not None)
+        # Show next to the orb
+        orb_pos = self.overlay.mapToGlobal(self.overlay.rect().topLeft())
+        self._hud.show_near(orb_pos, self.overlay.width(), self.overlay.height())
+
+    def _show_dashboard(self) -> None:
+        from src.dashboard import Dashboard
+        from pathlib import Path as _P
+        if self._dashboard is None:
+            if getattr(sys, "frozen", False):
+                base = _P(sys.executable).resolve().parent
+            else:
+                base = _P(__file__).resolve().parent.parent
+            self._dashboard = Dashboard(base_dir=base)
+        else:
+            self._dashboard.refresh()
+        self._dashboard.show()
+        self._dashboard.raise_()
+        self._dashboard.activateWindow()
 
     def _on_live_window_closed(self) -> None:
         """Called when the user closes the LiveWindow via the X button or

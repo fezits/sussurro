@@ -39,6 +39,7 @@ class OrbOverlay(QWidget):
     quit_requested = Signal()
     meeting_toggle_requested = Signal()
     transcribe_file_requested = Signal()
+    hud_requested = Signal()  # left click without drag
 
     LABEL_H = 26
     LABEL_MARGIN = 6
@@ -73,6 +74,8 @@ class OrbOverlay(QWidget):
         self._progress: float | None = None
         self._phase = 0.0
         self._drag_offset: QPoint | None = None
+        self._press_pos: QPoint = QPoint(0, 0)
+        self._dragged: bool = False
 
         self._timer = QTimer(self)
         self._timer.setInterval(33)
@@ -250,15 +253,26 @@ class OrbOverlay(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._press_pos = event.globalPosition().toPoint()
+            self._dragged = False
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            current = event.globalPosition().toPoint()
+            if not self._dragged and (current - self._press_pos).manhattanLength() > 6:
+                self._dragged = True
+            if self._dragged:
+                self.move(current - self._drag_offset)
             event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
+        was_drag = self._dragged
         self._drag_offset = None
+        self._dragged = False
+        if event.button() == Qt.MouseButton.LeftButton and not was_drag:
+            self.hud_requested.emit()
+            event.accept()
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
