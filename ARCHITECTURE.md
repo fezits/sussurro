@@ -129,6 +129,8 @@ SussurroApp._on_live_window_closed
 - **`_toggle_meeting()`** [src/app.py:194] — Item de menu "Iniciar/Parar reunião". Encapsula `_start_meeting` num try/except que loga falha e mostra erro na bolinha.
 - **`_start_meeting()`** [src/app.py:209] — Carrega `meeting_config.yaml`, valida `GROQ_API_KEY`, monta `MeetingTranscriber` + `LlmClient` × 2 + `SentenceTransformer` + `RagIndexer/Retriever` + `Responder` + `Summarizer` + `LiveWindow` + `MicCapture` + `SystemCapture` + `MeetingController`. Chama `controller.start()`.
 - **`_force_suggest()`** [src/app.py:355] — Pega o último turn `[Eles]` e dispara `responder.respond` numa thread (botão "Forçar sugestão" da janela).
+- **`_transcribe_file()`** [src/app.py] — Slot do `transcribe_file_requested`. Valida que não há reunião ativa, abre `QFileDialog`, dispara worker thread.
+- **`_transcribe_file_worker(path)`** — Em background: monta deps mínimas (sem mic/loopback, sem responder/RAG), cria `LiveWindow`, instancia `MeetingController`, chama `controller.start_from_file(path, on_progress=callback)`. Quando termina, chama `_stop_meeting()` que reusa o mesmo fluxo de finalização (drain pipeline, sumário, salvar arquivos, painel verde).
 - **`_stop_meeting()`** [src/app.py:411] — Dispara `controller.stop(on_progress=callback)` em thread separada; **não fecha a janela**. Conectado via `meeting_stop_progress` e `meeting_stop_finished` (signals Qt).
 - **`_on_meeting_stop_progress(msg)`** — Slot do signal; chama `live_window.show_finalization_status(msg)` e atualiza o label da bolinha.
 - **`_on_meeting_stop_finished(result)`** — Slot final; quando `result` tem `session_dir`, chama `live_window.show_finalization_complete(...)` mostrando painel verde com botões. Quando vazio, fecha janela.
@@ -140,7 +142,7 @@ SussurroApp._on_live_window_closed
 - **`set_state(state, status, progress)`** [src/overlay.py:93] — Muda cor/animação da bolinha e label embaixo. Estados: IDLE, RECORDING, TRANSCRIBING, LOADING, ERROR.
 - **`paintEvent`** [src/overlay.py:106] — Desenha o orb com gradient + glow + animação interna (microfone / waveform / spinner) por estado.
 - **`mousePressEvent` / `mouseMoveEvent`** — Arrasta a bolinha.
-- **`contextMenuEvent`** [src/overlay.py:262] — Menu de clique direito: status, "Iniciar/Parar reunião" → emite `meeting_toggle_requested`, "Sair" → emite `quit_requested`.
+- **`contextMenuEvent`** [src/overlay.py:262] — Menu de clique direito: status, "Iniciar/Parar reunião" → emite `meeting_toggle_requested`, "Transcrever arquivo…" → emite `transcribe_file_requested` (desabilitado quando há reunião ativa), "Sair" → emite `quit_requested`.
 - **`set_meeting_active(active)`** [src/overlay.py:278] — Atualiza texto do item de menu.
 
 ### `src/recorder.py` — Captura do ditado
@@ -188,6 +190,10 @@ SussurroApp._on_live_window_closed
 - **`open()`** — Abre `sounddevice.InputStream` mono float32. Coexiste com `Recorder` do ditado (WASAPI shared mode permite múltiplos consumers).
 - **`close()`** — Para o stream.
 - **`_callback`** — Achata pra mono, copia, chama `on_audio(chunk)`.
+
+### `meeting/audio/file_source.py` — Decodifica arquivo de mídia em chunks
+- **`probe_duration_seconds(path)`** — Retorna duração em segundos via PyAV (`container.duration`). 0.0 se desconhecido.
+- **`iter_chunks(path, chunk_seconds=30, target_rate=16000)`** — Generator. Abre o arquivo com `av.open`, encontra a stream de áudio, resampla pra mono float32 @ 16kHz com `av.audio.resampler.AudioResampler`, agrupa em chunks de ~30s e faz `yield`. Suporta qualquer formato que ffmpeg lê (mp3, mp4, wav, m4a, ogg, webm, mkv, aac, flac). Usado por `MeetingController.start_from_file`.
 
 ### `meeting/audio/system_capture.py` — Canal "Eles"
 - **`SystemCapture.__init__`** — Usa `pyaudiowpatch` pra acessar WASAPI loopback (saída das caixas/fone).
@@ -295,7 +301,8 @@ SussurroApp._on_live_window_closed
 ### `meeting/controller.py` — Orquestrador do modo reunião
 - **`MeetingDeps`** — Dataclass agrupando todas dependências injetadas (testabilidade).
 - **`MeetingController.__init__(deps)`** — Cria 2 `Vad` + 2 `ChannelBuffer` (`_buf_them` `_buf_you`), inicializa `_turns=[]`, `_recent_them_audio=deque(maxlen=10)`.
-- **`start()`** [meeting/controller.py:55] — Cria SessionWriter via factory, inicia. Sobe pipeline. Conecta `on_audio` dos capturers em `_on_mic_audio`/`_on_sys_audio`. Abre capturers. Estado → RECORDING.
+- **`start()`** [meeting/controller.py:55] — Cria SessionWriter via factory, inicia. Sobe pipeline. Conecta `on_audio` dos capturers em `_on_mic_audio`/`_on_sys_audio`. Abre capturers. Estado → RECORDING. Inicia thread de heartbeat.
+- **`start_from_file(path, on_progress=None)`** [meeting/controller.py:~120] — Modo arquivo: pula `mic_capture`/`system_capture`. Itera `file_source.iter_chunks(path)` e submete cada chunk como `Speaker.THEM` ao pipeline. Síncrono: retorna quando todos os chunks foram dispatched. Caller chama `stop()` em seguida pra drenar pool, sumarizar e salvar arquivos. `on_progress(pct, msg)` é chamado a cada chunk.
 - **`stop(on_progress=None)`** [meeting/controller.py:71] — Aceita callback `on_progress(msg)` para reportar etapa atual em pt-BR (UI mostra). Sequência (todos try/except: nenhum erro impede o resto):
   1. "Fechando microfone…" → `mic_capture.close()`
   2. "Fechando captura do sistema…" → `system_capture.close()`

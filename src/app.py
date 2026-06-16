@@ -48,6 +48,7 @@ class SussurroApp(QObject):
         )
         self.overlay.quit_requested.connect(self._quit)
         self.overlay.meeting_toggle_requested.connect(self._toggle_meeting)
+        self.overlay.transcribe_file_requested.connect(self._transcribe_file)
         self._meeting_controller = None
         self._meeting_window = None
         self._stopping_meeting = False
@@ -129,8 +130,11 @@ class SussurroApp(QObject):
 
             self._set_state(OverlayState.LOADING, "Inicializando motor…", progress=None)
             dev = self.transcriber.device
+            log.info("Whisper ready · device=%s · starting hotkey listener", dev)
             self.hotkey.start()
+            log.info("Hotkey listener started · combo=%s", self.config["hotkey"]["combo"])
             self._set_state(OverlayState.IDLE, f"Pronto · Ctrl+Win p/ falar")
+            log.info("=== App READY (dictation active, meeting menu enabled) ===")
         except Exception as e:
             if self._download_monitor is not None:
                 self._download_monitor.stop()
@@ -145,24 +149,33 @@ class SussurroApp(QObject):
         self.overlay.set_state(state, text, progress=progress if isinstance(progress, (int, float)) else None)
 
     def _on_hotkey_press(self) -> None:
+        log.info("HOTKEY press · transcriber_ready=%s · busy=%s · recording=%s",
+                 self.transcriber is not None, self._busy, self.recorder.is_recording)
         if self.transcriber is None or self._busy:
+            log.info("Hotkey ignored (transcriber=None or busy)")
             return
         if self.recorder.is_recording:
+            log.info("Hotkey ignored (already recording)")
             return
         try:
             self.recorder.start()
             self._recording_started_at = time.monotonic()
             self._set_state(OverlayState.RECORDING, "Gravando…")
+            log.info("Dictation recording STARTED")
         except Exception as e:
+            log.exception("Dictation start FAILED")
             traceback.print_exc()
             self._set_state(OverlayState.ERROR, f"Erro mic: {e}")
 
     def _on_hotkey_release(self) -> None:
+        log.info("HOTKEY release · recording=%s", self.recorder.is_recording)
         if not self.recorder.is_recording:
             return
         try:
             audio = self.recorder.stop()
+            log.info("Dictation stop · audio %.2fs (%d samples)", audio.size/16000, audio.size)
         except Exception as e:
+            log.exception("Dictation stop FAILED")
             traceback.print_exc()
             self._set_state(OverlayState.ERROR, f"Erro mic: {e}")
             return
@@ -173,17 +186,21 @@ class SussurroApp(QObject):
         self._recording_started_at = None
 
         if duration < MIN_RECORDING_SECONDS or audio.size == 0:
+            log.info("Dictation discarded · too short (%.2fs, %d samples)", duration, audio.size)
             self._set_state(OverlayState.IDLE, "Muito curto")
             return
 
         self._busy = True
         self._set_state(OverlayState.TRANSCRIBING, "Transcrevendo…")
+        log.info("Dispatching dictation to transcriber thread")
         threading.Thread(target=self._transcribe_and_inject, args=(audio,), daemon=True).start()
 
     def _transcribe_and_inject(self, audio: np.ndarray) -> None:
         try:
+            log.info("Dictation transcribe · %.2fs", audio.size/16000)
             text = self.transcriber.transcribe(audio) if self.transcriber else ""
             text = (text or "").strip()
+            log.info("Dictation transcribed · text=%r", text[:120])
             if not text:
                 self._set_state(OverlayState.IDLE, "Nada reconhecido")
                 return
@@ -202,7 +219,8 @@ class SussurroApp(QObject):
             self._busy = False
 
     def _toggle_meeting(self) -> None:
-        log.info("Meeting toggle requested · controller=%s", self._meeting_controller)
+        log.info("=== MEETING TOGGLE clicked === · controller=%s · transcriber_ready=%s",
+                 self._meeting_controller, self.transcriber is not None)
         if self._meeting_controller is None or self._meeting_controller.state.value == "stopped":
             try:
                 self._start_meeting()
@@ -391,6 +409,147 @@ class SussurroApp(QObject):
         self.overlay.set_meeting_active(True)
         self._set_state(OverlayState.RECORDING, "Reunião ativa")
         log.info("--- Meeting mode RUNNING ---")
+
+    def _transcribe_file(self) -> None:
+        """Pick a media file and transcribe it through the same pipeline.
+        Reuses the meeting LiveWindow + SessionWriter + Summarizer, but
+        skips mic/loopback capture.
+        """
+        log.info("=== TRANSCRIBE FILE clicked ===")
+        if self._meeting_controller is not None:
+            log.info("Meeting active; ignoring file transcribe request")
+            self._set_state(OverlayState.ERROR, "Pare a reunião ativa primeiro")
+            return
+        if self.transcriber is None:
+            log.info("Transcriber not ready yet")
+            self._set_state(OverlayState.ERROR, "Aguarde o modelo carregar")
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+        filters = (
+            "Áudio/Vídeo (*.mp3 *.mp4 *.wav *.m4a *.ogg *.webm *.mkv *.aac *.flac);;"
+            "Todos os arquivos (*)"
+        )
+        file_str, _ = QFileDialog.getOpenFileName(
+            None, "Escolha arquivo para transcrever", "", filters
+        )
+        if not file_str:
+            log.info("File dialog cancelled")
+            return
+
+        file_path = Path(file_str)
+        log.info("File selected: %s", file_path)
+        threading.Thread(
+            target=self._transcribe_file_worker, args=(file_path,), daemon=True
+        ).start()
+
+    def _transcribe_file_worker(self, file_path: Path) -> None:
+        try:
+            from pathlib import Path as _P
+            import yaml
+            from meeting.controller import MeetingController, MeetingDeps
+            from meeting.intelligence.classifier import Classifier
+            from meeting.intelligence.llm_client import LlmClient, LlmConfig
+            from meeting.intelligence.question_detector import QuestionDetector
+            from meeting.intelligence.rag.indexer import RagIndexer
+            from meeting.intelligence.rag.retriever import RagRetriever
+            from meeting.intelligence.responder import Responder
+            from meeting.intelligence.summarizer import Summarizer
+            from meeting.persistence.session_writer import SessionWriter
+            from meeting.transcribe.adapter import MeetingTranscriber
+            from meeting.transcribe.pipeline import TranscribePipeline
+            from meeting.ui.live_window import LiveWindow
+
+            if getattr(sys, "frozen", False):
+                base = _P(sys.executable).resolve().parent
+            else:
+                base = _P(__file__).resolve().parent.parent
+            cfg_candidates = [
+                base / "meeting" / "meeting_config.yaml",
+                base / "_internal" / "meeting" / "meeting_config.yaml",
+            ]
+            cfg_path = next((p for p in cfg_candidates if p.exists()), cfg_candidates[0])
+            config = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+            models_dir = base / "models"
+            output_dir = base / config["storage"]["output_dir"]
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            self._set_state(OverlayState.LOADING, f"Abrindo {file_path.name}…")
+            transcriber = MeetingTranscriber(
+                model_size=config["transcribe"]["model"],
+                language=config["transcribe"]["language"],
+                download_root=models_dir,
+            )
+            pipeline = TranscribePipeline(
+                transcriber=transcriber,
+                on_turn=lambda t: None,
+                workers=config["transcribe"]["parallel_workers"],
+            )
+
+            # Summarizer is required at stop(); use a stub LLM if Groq missing.
+            api_key_env = config["llm"]["api_key_env"]
+            import os as _os
+            has_key = bool(_os.environ.get(api_key_env, "").strip())
+            if has_key:
+                llm_main = LlmClient(LlmConfig(
+                    provider=config["llm"]["provider"],
+                    model=config["llm"]["model"],
+                    api_key_env=api_key_env,
+                ))
+                summarizer = Summarizer(llm=llm_main, model=config["llm"]["model"])
+            else:
+                log.warning("No %s set; skipping LLM summary", api_key_env)
+                class _NoLlm:
+                    def complete(self, _messages): return "## Resumo\n_Sem chave LLM configurada._\n"
+                summarizer = Summarizer(llm=_NoLlm(), model="none")
+
+            self._meeting_window = LiveWindow(opacity=config["ui"]["opacity"])
+            self._meeting_window.closed.connect(self._on_live_window_closed)
+            self._meeting_window.stop_requested.connect(self._stop_meeting)
+            self._meeting_window.pause_requested.connect(self._noop)
+            self._meeting_window.force_suggest_requested.connect(self._noop)
+            self._meeting_window.show()
+
+            deps = MeetingDeps(
+                mic_capture=None,
+                system_capture=None,
+                pipeline=pipeline,
+                responder=None,
+                summarizer=summarizer,
+                session_writer_factory=lambda sid: SessionWriter(
+                    root=output_dir,
+                    session_id=sid,
+                ),
+                live_window=self._meeting_window,
+                question_detector=QuestionDetector(),
+                config=config,
+            )
+            self._meeting_controller = MeetingController(deps)
+            pipeline.on_turn = self._meeting_controller._on_turn
+            self.overlay.set_meeting_active(True)
+
+            def progress(pct: float, msg: str) -> None:
+                # Marshalled via signal so UI updates safely.
+                self.meeting_stop_progress.emit(msg)
+
+            self._meeting_window.show_finalization_status(f"Transcrevendo {file_path.name}…")
+            log.info("Starting file transcription · %s", file_path)
+            self._meeting_controller.start_from_file(file_path, on_progress=progress)
+            log.info("File chunks dispatched, calling stop() to drain pipeline + summarize")
+
+            # Re-use the normal stop() path: drains pipeline, summary, save files.
+            self._stop_meeting()
+        except Exception:
+            log.exception("Falha em _transcribe_file_worker")
+            self._set_state(OverlayState.ERROR, "Erro ao transcrever arquivo")
+            self._stopping_meeting = False
+            if self._meeting_window is not None:
+                try: self._meeting_window.close()
+                except Exception: pass
+                self._meeting_window = None
+            self._meeting_controller = None
+            self.overlay.set_meeting_active(False)
 
     def _force_suggest(self) -> None:
         if self._meeting_controller is None:

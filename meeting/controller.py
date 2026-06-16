@@ -91,6 +91,52 @@ class MeetingController:
         self._dbg_timer_stop.clear()
         threading.Thread(target=self._dbg_heartbeat, daemon=True).start()
 
+    def start_from_file(
+        self,
+        path: "Path",
+        on_progress: "Callable[[float, str], None] | None" = None,
+    ) -> None:
+        """Transcribe a media file (mp3/mp4/wav/etc) through the same pipeline,
+        without opening mic/loopback. All turns are tagged as Speaker.THEM.
+
+        Runs synchronously: returns when every chunk has been pushed to the
+        pipeline. The caller should then call stop() to finalize transcription
+        (drain pool, generate summary, save files).
+
+        on_progress(percent, message) is called as chunks are dispatched.
+        """
+        from pathlib import Path as _P
+        from meeting.audio.file_source import iter_chunks, probe_duration_seconds
+        path = _P(path)
+        log.info("start_from_file · %s", path)
+
+        self.session_id = SessionId.now()
+        self._writer = self.deps.session_writer_factory(self.session_id)
+        self._writer.start()
+        self.deps.pipeline.start()
+        self.state = MeetingState.RECORDING
+
+        duration = probe_duration_seconds(path)
+        log.info("File duration: %.1fs", duration)
+
+        elapsed = 0.0
+        chunk_seconds = 30.0
+        for chunk in iter_chunks(path, chunk_seconds=chunk_seconds):
+            seconds = chunk.size / 16000
+            self._dbg["pipeline_submits"] += 1
+            log.info("File chunk · %.2fs (cumulative %.1f/%.1f)", seconds, elapsed + seconds, duration)
+            self.deps.pipeline.submit(Speaker.THEM, chunk)
+            elapsed += seconds
+            if on_progress and duration > 0:
+                pct = min(0.99, elapsed / duration)
+                on_progress(pct, f"Lendo arquivo · {int(pct*100)}%")
+            elif on_progress:
+                on_progress(0.0, f"Lendo arquivo · {elapsed:.0f}s lidos")
+
+        if on_progress:
+            on_progress(0.99, "Aguardando transcrição dos últimos chunks…")
+        log.info("All file chunks dispatched · %.1fs of audio", elapsed)
+
     def _dbg_heartbeat(self) -> None:
         last_snapshot = dict(self._dbg)
         while not self._dbg_timer_stop.wait(5.0):
